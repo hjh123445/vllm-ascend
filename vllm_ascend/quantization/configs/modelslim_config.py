@@ -27,6 +27,7 @@ import os
 from collections.abc import Callable
 from copy import deepcopy
 from functools import wraps
+from types import MethodType
 from typing import Any, Optional
 
 import regex as re
@@ -76,33 +77,86 @@ _MXFP_C8_UNUSED_FA_SUFFIXES = (
 )
 
 
+# Instance attribute holding the upstream (unbound) MoE weight loader while
+# the ModelSlim name-mapping wrapper is installed. Only the plain function is
+# stored, never the bound method, so the layer holds no self-reference.
+_MODELSLIM_ORIG_WEIGHT_LOADER = "_modelslim_orig_weight_loader"
+
+
+def _map_modelslim_moe_weight_name(weight_name: str) -> str:
+    prefix, separator, param_name = weight_name.rpartition(".")
+    mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
+    return f"{prefix}{separator}{mapped_name}"
+
+
+def _bound_modelslim_moe_weight_loader(
+    layer: torch.nn.Module,
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    weight_name: str,
+    shard_id: str,
+    expert_id: int,
+    return_success: bool = False,
+) -> bool | None:
+    """Bound-method form of the ModelSlim MoE name-mapping loader."""
+    weight_loader = getattr(layer, _MODELSLIM_ORIG_WEIGHT_LOADER)
+    return weight_loader(
+        layer,
+        param=param,
+        loaded_weight=loaded_weight,
+        weight_name=_map_modelslim_moe_weight_name(weight_name),
+        shard_id=shard_id,
+        expert_id=expert_id,
+        return_success=return_success,
+    )
+
+
 def _make_modelslim_moe_weight_loader(
     weight_loader: Callable[..., bool | None],
 ) -> Callable[..., bool | None]:
-    """Map ModelSlim MoE scale-bias names to the upstream scale path."""
+    """Map ModelSlim MoE scale-bias names to the upstream scale path.
 
-    @wraps(weight_loader)
-    def modelslim_moe_weight_loader(
-        param: torch.nn.Parameter,
-        loaded_weight: torch.Tensor,
-        weight_name: str,
-        shard_id: str,
-        expert_id: int,
-        return_success: bool = False,
-    ) -> bool | None:
-        prefix, separator, param_name = weight_name.rpartition(".")
-        mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
-        mapped_weight_name = f"{prefix}{separator}{mapped_name}"
-        return weight_loader(
-            param=param,
-            loaded_weight=loaded_weight,
-            weight_name=mapped_weight_name,
-            shard_id=shard_id,
-            expert_id=expert_id,
-            return_success=return_success,
-        )
+    For a bound loader the wrapper is returned as a bound method of the same
+    layer. vLLM's layerwise reload machinery sanitizes parameter attributes
+    through their ``__self__`` (see
+    ``vllm.model_executor.model_loader.reload.sanitize.sanitize_layer_refs``);
+    a plain closure wrapper keeps the original bound loader alive through its
+    closure cells and the ``__wrapped__`` attribute, pinning a discarded layer
+    and its weights in ``LAYERWISE_INFO`` forever (issue #18679). The
+    bound-method form is sanitized and restored like any other loader.
 
-    return modelslim_moe_weight_loader
+    For non-bound loaders (e.g. plain mocks in unit tests) the closure form is
+    kept, since there is no layer reference to retain.
+    """
+    if getattr(weight_loader, "__func__", None) is _bound_modelslim_moe_weight_loader:
+        # Already wrapped; keep the existing wrapper (and its stored original).
+        return weight_loader
+
+    layer = getattr(weight_loader, "__self__", None)
+    if layer is None:
+
+        @wraps(weight_loader)
+        def modelslim_moe_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            return weight_loader(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=_map_modelslim_moe_weight_name(weight_name),
+                shard_id=shard_id,
+                expert_id=expert_id,
+                return_success=return_success,
+            )
+
+        return modelslim_moe_weight_loader
+
+    setattr(layer, _MODELSLIM_ORIG_WEIGHT_LOADER, weight_loader.__func__)
+    return MethodType(_bound_modelslim_moe_weight_loader, layer)
 
 
 # The config filename that ModelSlim generates after quantizing a model.
